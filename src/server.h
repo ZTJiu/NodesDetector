@@ -14,7 +14,7 @@ private:
 public:
     Server* Instance();
     Init(string ip, uint16_t port);
-    Run();
+    void Run();
 
 private:
     Server* _server;
