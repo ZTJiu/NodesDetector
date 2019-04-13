@@ -1,0 +1,12 @@
+[submodule "ccbase"]
+	path = ccbase
+	url = https://github.com/mikewei/ccbase.git
+[submodule "hyperudp"]
+	path = hyperudp
+	url = https://github.com/mikewei/hyperudp.git
+[submodule "grpc"]
+	path = grpc
+	url = https://github.com/grpc/grpc.git
+[submodule "third_party"]
+	path = third_party
+	url = https://github.com/ZTJiu/third_party.git

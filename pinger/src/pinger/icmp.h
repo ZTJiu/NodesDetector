@@ -18,21 +18,21 @@ NAMESPACE_PG_BEGIN
 #define ICMP_TOTAL_LEN 64   // Just like a ping command
 
 struct PingInfo {
-    int16_t delay;
+    int16_t cost;
     uint32_t dst_ip;
     uint64_t task_id;
 };
 
 class Icmp final {
     public:
-        explicit Icmp(uint32_t src_ip): src_ip_(src_ip) {}
+        Icmp(uint32_t src_ip, uint16_t process_id);
         bool PackIcmpPacket(uint32_t dst_ip, uint16_t seq_num,
 				uint64_t task_id, char * buffer, size_t buffer_len);
-        bool ParseIcmpPakcet(const char * packet, size_t len, PingInfo & info);
+        bool ParseIcmpPakcet(const char * packet, size_t len, PingInfo * info, bool *not_my_pkt);
 
     private:
         uint32_t src_ip_;
-		uint16_t icmp_id_; // process id
+	uint16_t icmp_id_; // process id
 };
 
 NAMESPACE_PG_END

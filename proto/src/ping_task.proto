@@ -1,0 +1,18 @@
+syntax = "proto3";
+package nodes.detector;
+
+message PingRequest {
+    string ip = 1; // ping ip
+    uint32 count = 2; // ping count times
+    uint32 seq_id = 3; // seq id
+    uint64 task_id = 4; // task id
+}
+
+message PingResponse {
+    string ip = 1; // ping ip
+    uint32 count = 2; // ping count
+    uint32 success = 3; // success count
+    int32 average_delay = 4; // average delay
+    uint64 task_id = 5; // task id
+}
+

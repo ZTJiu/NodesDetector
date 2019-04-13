@@ -21,8 +21,12 @@ class Options {
         }
 
         std::string ToString() const;
-        std::string LocalIp() const;
-        std::string LogPropertiesConfPath() const;
+        const std::string & LocalIp() const;
+        const std::string & LogPropertiesConfPath() const;
+        int WorkerNum() const;
+        int WorkerQlen() const;
+        const std::string & HudpListenIp() const;
+        int HudpListenPort() const;
 
     private:
         Options() {}

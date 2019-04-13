@@ -13,21 +13,30 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <fcntl.h>
+#include <arpa/inet.h> // for inet_pton
 
-#include "slog/slog.h"
 #include "pinger/icmp.h"
+#include "glog/logging.h"
 
 NAMESPACE_PG_BEGIN
 
+std::vector<std::string> ips = {
+    "220.181.57.216",
+    "123.125.115.110",
+    "111.161.64.40",
+    "111.161.64.48"
+};
 
-Pinger::Pinger(uint32_t src_ip): icmp_(src_ip) {
+Pinger::Pinger(uint32_t src_ip): icmp_(src_ip, static_cast<uint16_t>(::getpid())),
+        ips_(ips) {
     loop_ = ev_loop_new(EVFLAG_AUTO);
+
 }
 
 bool Pinger::Start() {
     ev_fd_ = eventfd(0, O_NONBLOCK);
     if (ev_fd_ == -1) {
-        LOG_ERROR("eventfd error: %s", strerror(errno));
+        PLOG(ERROR) << "eventfd error";
         return false;
     }
     stop_watcher_.data = this;
@@ -36,13 +45,13 @@ bool Pinger::Start() {
 
     raw_sock_fd_ = socket(AF_INET, SOCK_RAW | SOCK_NONBLOCK, IPPROTO_ICMP);
     if (raw_sock_fd_ == -1) {
-        LOG_ERROR("socket() failed: %s", strerror(errno));
+        PLOG(ERROR) << "socket() failed";
         return false;
     }
     setuid(getuid());
     size_t buf_size = 1024 * 1024;
     if (setsockopt(raw_sock_fd_, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size)) == -1) {
-        LOG_ERROR("setsocketopt() failed: %s", strerror(errno));
+        PLOG(ERROR) << "setsocketopt() failed";
         return false;
     }
 
@@ -56,18 +65,32 @@ bool Pinger::Start() {
     return true;
 }
 
+void Pinger::SendRequest() {
+    LOG(INFO) << "SendRequest: " << ips_.size();
+    uint64_t id = 0;
+    for (auto ip : ips_) {
+        PingRequest request;
+        request.set_ip(ip);
+        request.set_count(5);
+        request.set_task_id(id++);
+        PostTask(std::move(request));
+        LOG(INFO) << "SEND request, ip=" << ip << " task_id=" << (id - 1);
+	google::FlushLogFiles(google::INFO);
+    }
+}
+
 bool Pinger::Stop() {
     uint64_t value;
     int ret = write(ev_fd_, &value, sizeof(value));
     if (ret != 8) {
-        LOG_ERROR("write ev_fd_ failed: %s", strerror(errno));
+        PLOG(ERROR) << "write ev_fd_ failed";
         return false;
     }
     return true;
 }
 
 bool Pinger::Wait() {
-    LOG_INFO("Start ev_run");
+    LOG(INFO) << "Start ev_run";
     ev_run(loop_, 0);
     return true;
 }
@@ -79,11 +102,11 @@ void Pinger::Shutdown(struct ev_loop * loop, struct ev_io * watcher, int revents
     uint64_t value;
     int ret = read(pinger->ev_fd_, &value, sizeof(value));
     if (ret != 8) {
-        LOG_ERROR("read ev_fd_ failed: %s", strerror(errno));
+        PLOG(ERROR) << "read ev_fd_ failed";
         return;
     }
     ev_break(pinger->loop_, EVBREAK_ONE);
-    LOG_WARN("pinger is stopping...");
+    LOG(WARNING) << "pinger is stopping...";
 }
 
 void Pinger::HandleRecv(struct ev_loop * loop, struct ev_io * watcher, int revents) {
@@ -97,72 +120,81 @@ void Pinger::HandleRecv(struct ev_loop * loop, struct ev_io * watcher, int reven
             reinterpret_cast<struct sockaddr *>(&src_addr), &addr_len);
     if (ret == -1) {
         if (errno != EAGAIN) {
-            LOG_ERROR("recvfrom error: %s", strerror(errno));
+            PLOG(ERROR) << "recvfrom error";
         }
         return;
     }
 
     if (ret < ICMP_TOTAL_LEN) {
-        LOG_ERROR("NOT my icmp packet");
+        LOG(ERROR) << "NOT my icmp packet";
         return;
     }
 
+    bool not_my_pkt = false;
     struct PingInfo info;
     info.dst_ip = src_addr.sin_addr.s_addr;
-    if (!pinger->icmp_.ParseIcmpPakcet(buffer, ret, info)) {
-        LOG_ERROR("ParseIcmpPakcet failed");
-        return;
+    if (pinger->icmp_.ParseIcmpPakcet(buffer, ret, &info, &not_my_pkt)) {
+        // TODO: callback
+    } else {
+	if (!not_my_pkt)
+        	LOG(ERROR) << "ParseIcmpPakcet failed";
     }
-
 }
 
 void Pinger::HandleSend(struct ev_loop * loop, struct ev_io * watcher, int revents) {
     struct ev_data * ev_data = reinterpret_cast<struct ev_data *>(watcher);
     Pinger * pinger = reinterpret_cast<Pinger *>(ev_data->data);
 
-    if (pinger->send_queue_.empty()) {
-        return;
-    }
-
     int batch_num = 300;
-    std::lock_guard<std::mutex> lock(pinger->send_queue_mtx_);
-    while (!pinger->send_queue_.empty() && batch_num > 0) {
-        --batch_num;
-        PingTask * task = pinger->send_queue_.front();
-        if (!pinger->SendIcmp(task)) {
-            break;
-        }
-        pinger->send_queue_.pop();
+    PingRequest request;
+    while (batch_num-- > 0 && pinger->task_queue_.try_dequeue(request)) {
+        pinger->SendIcmp(request);
     }
 }
 
-bool Pinger::SendIcmp(PingTask * task) {
-    char packet[128];
-    size_t len = 64;
+void Pinger::HandleTimeout(struct ev_loop * loop, ev_io * watcher, int revents) {
+    struct ev_data * ev_data = reinterpret_cast<struct ev_data *>(watcher);
+    Pinger * pinger = reinterpret_cast<Pinger *>(ev_data->data);
+}
 
-    if (!icmp_.PackIcmpPacket(task->dst_ip, task->seq_num,
-                task->task_id, packet, len)) {
-        LOG_ERROR("PackIcmpPacket() failed");
-        return false;
-    }
+void Pinger::SendIcmp(PingRequest & request) {
+    char packet[128] = {0};
+    size_t len = 64;
 
     struct sockaddr_in sockaddr;
     sockaddr.sin_family = AF_INET;
-    sockaddr.sin_addr.s_addr = task->dst_ip;
+    // FIXME: check error
+    inet_pton(AF_INET, request.ip().c_str(), &sockaddr.sin_addr.s_addr);
 
-    if (sendto(raw_sock_fd_, packet, len, 0, (struct sockaddr *)&sockaddr,
-                sizeof(struct sockaddr)) < 0)  {
-        LOG_ERROR("sendto() failed: %s", strerror(errno));
-        return false;
-    }
+    uint16_t seq_id = static_cast<uint16_t>(request.seq_id());
+    request.set_seq_id(seq_id + 1);
 
-    return true;
+    do {
+        if (!icmp_.PackIcmpPacket(sockaddr.sin_addr.s_addr, seq_id,
+                    request.task_id(), packet, len)) {
+            LOG(ERROR) << "PackIcmpPacket() failed";
+            break;
+        }
+
+        if (sendto(raw_sock_fd_, packet, len, 0, (struct sockaddr *)&sockaddr,
+                    sizeof(struct sockaddr)) < 0)  {
+            PLOG(ERROR) << "sendto() failed";
+            break;
+        }
+    } while(0);
+
+    // TODO: post task
 }
 
-bool Pinger::PostTask(PingTask * task) {
-    std::lock_guard<std::mutex> lock(send_queue_mtx_);
-    send_queue_.push(task);
-    return true;
+bool Pinger::PostTask(PingRequest && request) {
+    return task_queue_.enqueue(std::move(request));
 }
+/*
+void Pinger::AddTimer(double after, void * tag) {
+    ev_timer * timeout_watcher = new ev_timer;
+    ev_timer_init(timeout_watcher, timeout_cb, after, 0.);
+    ev_timer_start(loop_, timeout_watcher);
+}
+*/
 
 NAMESPACE_PG_END

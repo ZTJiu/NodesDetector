@@ -20,36 +20,15 @@
 #include <cstdio>
 #include <cstring>
 
-#include "slog/slog.h"
+#include "glog/logging.h"
 
 NAMESPACE_PG_BEGIN
 
-/*struct icmphdr
-{
-  u_int8_t type;		// message type
-  u_int8_t code;		// type sub-code
-  u_int16_t checksum;
-  union
-  {
-    struct
-    {
-      u_int16_t	id;
-      u_int16_t	sequence;
-    } echo;			// echo datagram
-    u_int32_t	gateway;	// gateway address
-    struct
-    {
-      u_int16_t	__unused;
-      u_int16_t	mtu;
-    } frag;			// path mtu discovery
-  } un;
-};*/
-
 // Computing the internet checksum (RFC 1071).
 // Note that the internet checksum does not preclude collisions.
-static uint16_t checksum(uint16_t * buffer, int len) {
+static uint16_t CheckSum(uint16_t * buffer, int len, uint16_t csum) {
 	int count = len;
-	register uint32_t sum = 0;
+	register uint32_t sum = csum;
 	uint16_t answer = 0;
 
 	// Sum up 2-byte values until none or only one byte left.
@@ -76,7 +55,7 @@ static uint16_t checksum(uint16_t * buffer, int len) {
 	return (answer);
 }
 
-static uint16_t GetDelayMs(const struct timeval & recv_time, const struct timeval & send_time) {
+static uint16_t TimeDiff(const struct timeval & recv_time, const struct timeval & send_time) {
     if (recv_time.tv_usec >= send_time.tv_usec) {
         return static_cast<uint16_t>((recv_time.tv_sec - send_time.tv_sec) * 1000 +
                 (recv_time.tv_usec - send_time.tv_usec) / 1000);
@@ -86,6 +65,11 @@ static uint16_t GetDelayMs(const struct timeval & recv_time, const struct timeva
     }
 }
 
+Icmp::Icmp(uint32_t src_ip, uint16_t process_id)
+	: src_ip_(src_ip), icmp_id_(process_id) {
+    LOG(INFO) << "process_id=" << icmp_id_;
+}
+
 bool Icmp::PackIcmpPacket(uint32_t dst_ip, uint16_t seq_num,
 		uint64_t task_id, char * buffer, size_t buffer_len) {
     if (buffer_len < ICMP_TOTAL_LEN) {
@@ -93,49 +77,43 @@ bool Icmp::PackIcmpPacket(uint32_t dst_ip, uint16_t seq_num,
     }
 
 	//struct ip iphdr;
-	struct icmphdr icmphdr;
-	char data[ICMP_DATALEN];
+	struct icmphdr * icmphdr = reinterpret_cast<struct icmphdr *>(buffer);
     size_t datalen = ICMP_DATALEN;
 
 	// ICMP header
 	// Message Type (8 bits): echo request
-	icmphdr.type = ICMP_ECHO;
+	icmphdr->type = ICMP_ECHO;
 	// Message Code (8 bits): echo request
-	icmphdr.code = 0;
+	icmphdr->code = 0;
 	// Identifier (16 bits): usually pid of sending process - pick a number
-	icmphdr.un.echo.id = htons (icmp_id_);
+	icmphdr->un.echo.id = icmp_id_;
 	// Sequence Number (16 bits): starts at 0
-	icmphdr.un.echo.sequence = htons (seq_num);
+	icmphdr->un.echo.sequence = htons(seq_num);
 	// ICMP header checksum (16 bits): set to 0 when calculating checksum
-	icmphdr.checksum = 0;
+	icmphdr->checksum = 0;
+
+    memset(icmphdr + 1, 0, sizeof(struct timeval));
+    icmphdr->checksum = CheckSum(reinterpret_cast<uint16_t *>(buffer), ICMP_TOTAL_LEN, 0);
 
     // ICMP data
     // time stamp
-    struct timeval * now = reinterpret_cast<struct timeval *>(data);
+    struct timeval * now = reinterpret_cast<struct timeval *>(icmphdr + 1);
     gettimeofday(now, nullptr);
     // task_id
-    *(reinterpret_cast<uint64_t *>(data + 8)) = task_id;
-    // Just for fun
-    snprintf(data + 16, sizeof(data) - 16, "Hello, this is my ping command");
-
-	// Prepare buffer.
-
-	// Next part of buffer is upper layer protocol header.
-	memcpy (buffer, &icmphdr, ICMP_HDRLEN);
-	// Finally, add the ICMP data.
-	memcpy (buffer + ICMP_HDRLEN, data, datalen);
+    *(reinterpret_cast<uint64_t *>(now + 1)) = task_id;
 
 	// Calculate ICMP header checksum
-	icmphdr.checksum = checksum(reinterpret_cast<uint16_t *>(buffer),
-		ICMP_HDRLEN + datalen);
+	icmphdr->checksum = CheckSum(reinterpret_cast<uint16_t *>(buffer),
+		ICMP_HDRLEN + datalen, ~icmphdr->checksum);
 
     return true;
 }
 
 bool Icmp::ParseIcmpPakcet(const char * packet,
-        size_t len, PingInfo & info) {
+        size_t len, PingInfo * info, bool *not_my_pkt) {
     const struct ip * ip = reinterpret_cast<const struct ip *>(packet);
     size_t ip_hdr_len = ip->ip_hl << 2;
+
     if (ip->ip_p != IPPROTO_ICMP)
         return false;
 
@@ -145,21 +123,25 @@ bool Icmp::ParseIcmpPakcet(const char * packet,
         return false; // not our ICMP packet
 
     if (icmp_hdr->type != ICMP_ECHOREPLY ||
-            ntohs(icmp_hdr->un.echo.id) != icmp_id_) {
+            icmp_hdr->un.echo.id != icmp_id_) {
+        /*LOG(ERROR) << "check failed: icmp_hdr->type=" << (int)icmp_hdr->type
+		<< ", echo.id=" << icmp_hdr->un.echo.id << ", icmp_id_=" << icmp_id_;*/
+	*not_my_pkt = true;
         return false; // not our ICMP reply packet
     }
 
-    (packet + ip_hdr_len + ICMP_HDRLEN);
-    struct timeval send_time = *(reinterpret_cast<const struct timeval *>(packet + ip_hdr_len + ICMP_HDRLEN));
+    //(packet + ip_hdr_len + ICMP_HDRLEN);
+    //struct timeval send_time = *(reinterpret_cast<const struct timeval *>(packet + ip_hdr_len + ICMP_HDRLEN));
+    const struct timeval * send_time = reinterpret_cast<const struct timeval *>(icmp_hdr + 1);
     struct timeval recv_time;
-
     gettimeofday(&recv_time, nullptr);
-    info.delay = GetDelayMs(recv_time, send_time);
-    info.task_id = *(reinterpret_cast<const uint64_t *>(packet + ip_hdr_len + ICMP_HDRLEN + 8));
+    info->cost = TimeDiff(recv_time, *send_time);
+    info->task_id = *(reinterpret_cast<const uint64_t *>(send_time + 1));
 
-    struct in_addr addr = {info.dst_ip};
-    // FIXME(zhangtianjiu): not thread safe
-    LOG_INFO("ping %s\t%dms", inet_ntoa(addr), info.delay);
+    struct in_addr addr = {info->dst_ip};
+    // FIXME: inet_ntoa not thread safe
+    LOG(INFO) << "ping " << inet_ntoa(addr) << " task_id=" << info->task_id
+	<< " cost=" << info->cost << "ms";
 
     return true;
 }
